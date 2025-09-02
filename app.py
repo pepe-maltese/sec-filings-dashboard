@@ -31,6 +31,11 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+# Ensure Streamlit writes to a writable dir on HF Spaces (repo FS is read-only)
+os.environ.setdefault("STREAMLIT_HOME", "/tmp")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+
 import streamlit as st
 
 # ------------------------------
