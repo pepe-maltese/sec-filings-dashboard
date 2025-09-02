@@ -1,123 +1,200 @@
 """
-Real-Time SEC Filings Dashboard — Streamlit app
+BMNR Real‑Time SEC Filings Dashboard — Streamlit App
 
-- Rule-based summaries (free) + optional OpenAI single-paragraph summaries
-- Throttled requests to avoid 429/rate-limits
-- Cached AI summaries per filing to avoid re-paying
+Zero‑cost friendly: deploy on Hugging Face Spaces (Streamlit template) or Streamlit Community Cloud.
+
+Requirements (put these in requirements.txt if you split files):
+  streamlit>=1.37
+  requests>=2.32
+  beautifulsoup4>=4.12
+  lxml>=5.2
+  pandas>=2.2
+  python-dateutil>=2.9
+
+Optional env vars (set in your Space / Streamlit Cloud):
+  SEC_USER_AGENT="Your Name your.email@example.com"   # SEC requires a descriptive UA
+  DEFAULT_CIK="0001829311"  # BMNR padded to 10 digits (changeable in UI)
+
+Notes:
+- SEC asks clients to include a descriptive User‑Agent and to be respectful with rate limits (<=10 req/sec). We also add short sleeps and caching.
+- This app uses SEC's submissions JSON for speed, fetches specific filing documents on demand, and generates light rule‑based summaries locally (no paid AI required).
+- You can track any ticker/CIK, not just BMNR.
 """
 
 import os
-import re
 import time
+import re
 from datetime import datetime
 from dateutil import tz
 
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-import streamlit as st
 
-# Optional: OpenAI for summaries
+# Optional: OpenAI summaries
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# ------------------------------
-# Basic config & helpers
-# ------------------------------
-def get_secret(name: str, default: str = "") -> str:
-    """Read from st.secrets or environment."""
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return os.getenv(name, default)
-
-SEC_UA = get_secret("SEC_USER_AGENT", "FilingsDashboard/1.0 (contact: please-set-email@example.com)")
-DEFAULT_CIK = get_secret("DEFAULT_CIK", "0001829311")
-
-SEC_BASE = "https://data.sec.gov"
-ARCHIVES = "https://www.sec.gov/Archives"
-HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
-
-# Streamlit page
-st.set_page_config(page_title="SEC Filings Dashboard", page_icon="📄", layout="wide")
-st.title("📄 Real-Time SEC Filings Dashboard")
-st.caption("Free rule-based summaries. Optional OpenAI one-paragraph summaries (with throttling & caching).")
-
-# Respect HF Spaces read-only root (harmless elsewhere)
+# Ensure Streamlit writes to a writable dir on HF Spaces (repo FS is read-only)
 os.environ.setdefault("STREAMLIT_HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+
+import streamlit as st
+
+# ------------------------------
+# Config
+# ------------------------------
+# Build a resilient HTTP session with retries/backoff (handles 403/429 from SEC)
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def make_session():
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    retry = Retry(
+        total=5,
+        read=5,
+        connect=5,
+        backoff_factor=0.8,
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+SESSION = None
+# Prefer Streamlit Secrets on Streamlit Cloud; fallback to env
+try:
+    import streamlit as st  # already imported later, but safe here
+    _secret_ua = st.secrets.get("SEC_USER_AGENT") if hasattr(st, "secrets") else None
+except Exception:
+    _secret_ua = None
+SEC_UA = _secret_ua or os.getenv("SEC_USER_AGENT", "FilingsDashboard/1.0 (contact: please-set-email@example.com)")
+DEFAULT_CIK = os.getenv("DEFAULT_CIK", "0001829311")  # BMNR
+SEC_BASE = "https://data.sec.gov"
+ARCHIVES = "https://www.sec.gov/Archives"
+
+HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
+
+st.set_page_config(page_title="SEC Filings Dashboard", page_icon="📄", layout="wide")
+st.title("📄 Real‑Time SEC Filings Dashboard")
+st.caption("Zero‑cost deployable. Live feed from SEC EDGAR with local, rule‑based summaries. Optional: OpenAI-powered summaries if you add an API key.")
+
+# ------------------------------
+# OpenAI (optional) — AI summaries
+# ------------------------------
+
+def ai_summarize(text: str, form: str, model: str = "gpt-4o-mini") -> str:
+    """Return an AI-written summary paragraph. Requires OPENAI_API_KEY in secrets.
+    Falls back to rule-based summary if unavailable or errors."""
+    key = None
+    try:
+        key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else os.getenv("OPENAI_API_KEY")
+    except Exception:
+        key = os.getenv("OPENAI_API_KEY")
+    if not key or not OpenAI:
+        return ""
+    try:
+        client = OpenAI(api_key=key)
+        prompt = (
+            "You are an equity research assistant. Read the SEC filing excerpt below and write a concise, factual "
+            "summary (4-6 sentences) with a one-line headline first, then 3-6 bullet points of the most material items. "
+            "Prioritize financing (ATM/PIPE/warrants), buybacks, guidance, M&A, crypto holdings, and any Item references.
+
+"
+            f"Form: {form}
+
+Filing excerpt (may be partial):
+" + text[:16000]
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Be terse, precise, and neutral. Avoid speculation."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        st.info(f"AI summary skipped: {e}")
+        return ""
+
+# ------------------------------
+# Helpers
+# ------------------------------
 
 def pad_cik(cik: str) -> str:
     s = re.sub(r"\D", "", cik or "")
     return s.zfill(10) if s else ""
 
-# ------------------------------
-# HTTP helpers (polite + retry)
-# ------------------------------
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    retry = Retry(
-        total=4, read=4, connect=4,
-        backoff_factor=0.6,
-        status_forcelist=[403, 429, 500, 502, 503, 504],
-        allowed_methods=["GET"], raise_on_status=False
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter); s.mount("http://", adapter)
-    return s
-
-SESSION = make_session()
-
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_company_submissions(cik10: str) -> dict:
+    global SESSION
+    SESSION = SESSION or make_session()
     url = f"{SEC_BASE}/submissions/CIK{cik10}.json"
     r = SESSION.get(url, timeout=30)
     if r.status_code == 403:
-        st.warning("SEC returned 403 (Forbidden). Check your SEC_USER_AGENT in Settings → Secrets.")
+        st.error("SEC returned 403 (forbidden). Make sure your SEC_USER_AGENT secret is set to 'Your Name your@email.com'. Then restart the app.")
     r.raise_for_status()
     return r.json()
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_company_ticker_map() -> pd.DataFrame:
+    global SESSION
+    SESSION = SESSION or make_session()
     url = f"{SEC_BASE}/files/company_tickers.json"
     r = SESSION.get(url, timeout=30)
+    if r.status_code == 403:
+        st.error("SEC returned 403 (forbidden) while fetching ticker map. Check SEC_USER_AGENT in Secrets and try again.")
     r.raise_for_status()
     data = r.json()
-    rows = [{"cik": str(x.get("cik_str","")).zfill(10), "ticker": x.get("ticker",""), "title": x.get("title","")} for x in data]
+    # Convert to DataFrame
+    rows = []
+    for item in data:
+        rows.append({
+            "cik": str(item.get("cik_str", "")).zfill(10),
+            "ticker": item.get("ticker", ""),
+            "title": item.get("title", ""),
+        })
     return pd.DataFrame(rows)
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def cik_from_ticker(ticker: str) -> str:
-    try:
-        if not ticker: return ""
-        df = fetch_company_ticker_map()
-        hit = df[df["ticker"].str.upper() == ticker.upper()]
-        return pad_cik(hit.iloc[0]["cik"]) if not hit.empty else ""
-    except Exception:
-        st.warning("Could not resolve ticker (rate-limit or not found). Try CIK mode.")
+    if not ticker:
         return ""
+    df = fetch_company_ticker_map()
+    hit = df[df["ticker"].str.upper() == ticker.upper()]
+    if hit.empty:
+        return ""
+    return pad_cik(hit.iloc[0]["cik"])
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_primary_doc_text(cik10: str, accession_no: str, primary_doc: str) -> str:
+    global SESSION
+    SESSION = SESSION or make_session()
     acc_nodash = accession_no.replace("-", "")
     url = f"{ARCHIVES}/edgar/data/{int(cik10)}/{acc_nodash}/{primary_doc}"
     r = SESSION.get(url, timeout=60)
+    if r.status_code == 403:
+        st.error("SEC returned 403 while fetching the primary document. Verify SEC_USER_AGENT and try again.")
     r.raise_for_status()
+    # Parse HTML -> text
     soup = BeautifulSoup(r.text, "lxml")
-    for tag in soup(["script", "style"]): tag.decompose()
+    # Remove scripts/styles
+    for tag in soup(["script", "style"]):
+        tag.decompose()
     text = soup.get_text("\n", strip=True)
+    # Trim overly long text to keep UI responsive
     return text[:500000]
 
-# ------------------------------
-# Rule-based signals (free)
-# ------------------------------
 KEY_PATTERNS = {
     "financing": r"ATM|at-the-market|equity offering|registered direct|PIPE|warrant|convertible|shelf registration|S-3|ASR|capital raise",
     "insider": r"Form 4|beneficial owner|officer|director|grant|option|restricted stock|RSU",
@@ -127,21 +204,24 @@ KEY_PATTERNS = {
     "material": r"Item\s*1\.01|Material Definitive Agreement|Item\s*2\.01|acquisition|disposition|Item\s*3\.02|unregistered|Item\s*5\.02|departure|appointment|Item\s*5\.07|shareholder|vote",
 }
 
-def rule_summary(form: str, text: str) -> dict:
+TAG_WEIGHTS = {
+    "Positive": ["buyback",],
+    "Negative": ["financing"],
+    "Neutral": ["insider", "guidance"],
+}
+
+def generate_rule_based_summary(form: str, text: str) -> dict:
     snippet = text[:4000] if text else ""
     hits = {k: bool(re.search(p, snippet, re.IGNORECASE)) for k, p in KEY_PATTERNS.items()}
+    # Simple impact scoring
     score = 0
     if hits.get("buyback"): score += 2
     if hits.get("financing"): score -= 2
     if hits.get("material"): score += 1
+    if hits.get("insider"): score -= 0  # neutral
+    if hits.get("crypto"): score += 0   # informational
     impact = "Positive" if score >= 2 else ("Negative" if score <= -2 else "Neutral")
-    headline = f"{form}: {impact} — " + (
-        "buyback mentioned" if hits.get("buyback") else
-        "financing/dilution signals" if hits.get("financing") else
-        "material agreement or event" if hits.get("material") else
-        "insider/ownership update" if hits.get("insider") else
-        "no strong signal"
-    )
+
     bullets = []
     if hits.get("material"): bullets.append("Material item(s) indicated (e.g., Item 1.01/2.01/5.02/5.07).")
     if hits.get("financing"): bullets.append("Financing activity detected (ATM/PIPE/warrants/shelf). Potential dilution risk.")
@@ -149,72 +229,39 @@ def rule_summary(form: str, text: str) -> dict:
     if hits.get("insider"): bullets.append("Insider/beneficial ownership or equity grants referenced.")
     if hits.get("crypto"): bullets.append("Crypto/mining references present (BTC/ETH/hashrate).")
     if hits.get("guidance"): bullets.append("Guidance/outlook language present.")
+
+    headline = f"{form}: {impact} — "
+    if hits.get("buyback"): headline += "buyback mentioned"
+    elif hits.get("financing"): headline += "financing/dilution signals"
+    elif hits.get("material"): headline += "material agreement or event"
+    elif hits.get("insider"): headline += "insider/ownership update"
+    else: headline += "no strong signal"
+
     return {"impact": impact, "headline": headline, "bullets": bullets, "flags": hits}
 
-# ------------------------------
-# OpenAI single-paragraph summary (optional) + caching
-# ------------------------------
-@st.cache_data(show_spinner=False, ttl=7*24*3600)  # cache for a week
-def cached_ai_summary(accession: str, form: str, text_excerpt: str, model: str, key: str) -> str:
-    """Cache on (accession, model). Key string included so different org keys don't collide."""
-    if not key or not OpenAI:
-        return ""
-    client = OpenAI(api_key=key)
-    prompt = f"""Summarize the SEC filing excerpt in ONE concise paragraph (4–6 sentences).
-Focus on financing (ATM/PIPE/warrants), buybacks, guidance, M&A, crypto holdings, and any Item references (1.01/2.01/3.02/5.02/5.07).
-Be factual, neutral, and precise. Avoid speculation.
 
-Form: {form}
-
-Filing excerpt (may be partial):
-{text_excerpt}
-"""
-    # Call API
+def to_local(date_str: str) -> str:
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a precise equity research assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=300,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        # Return empty -> caller will fall back to rule-based
-        return f""  # keep cache simple
-
-def ai_summarize_one_paragraph(accession: str, form: str, text: str, model: str, delay_s: float) -> str:
-    key = get_secret("OPENAI_API_KEY", "")
-    if not key or not OpenAI:
-        return ""
-    time.sleep(max(0.0, delay_s))  # pacing before each OpenAI call
-    excerpt = (text or "")[:6000]  # keep tokens in check
-    return cached_ai_summary(accession, form, excerpt, model, key)
+        # SEC uses YYYY-MM-DD
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz.tzutc())
+        local = dt.astimezone(tz.tzlocal())
+        return local.strftime("%Y-%m-%d")
+    except Exception:
+        return date_str
 
 # ------------------------------
-# Sidebar controls
+# Sidebar Inputs
 # ------------------------------
 with st.sidebar:
     st.header("Settings")
-    # Default to CIK to avoid ticker-map calls on first render
-    mode = st.radio("Lookup by", ["Ticker", "CIK"], index=1)
-    if mode == "Ticker":
-        default_ticker = st.text_input("Ticker (e.g., BMNR)", value="BMNR")
-        cik10 = cik_from_ticker(default_ticker)
-    else:
-        cik_input = st.text_input("CIK (10 digits)", value=DEFAULT_CIK)
-        cik10 = pad_cik(cik_input)
+    mode = st.radio("Lookup by", ["Ticker", "CIK"], index=0)
+    default_ticker = st.text_input("Ticker (e.g., BMNR)", value="BMNR")
+    cik_input = st.text_input("CIK (10 digits)", value=DEFAULT_CIK)
+    cik10 = pad_cik(cik_input) if mode == "CIK" else cik_from_ticker(default_ticker)
 
     st.markdown("---")
-    use_ai = st.checkbox("Use OpenAI one-paragraph summaries (optional)", value=False)
+    use_ai = st.checkbox("Use OpenAI summaries (optional)", value=False, help="Requires OPENAI_API_KEY in Secrets")
     ai_model = st.text_input("OpenAI model", value="gpt-4o-mini") if use_ai else None
-    max_ai = st.slider("Max AI summaries this run", 0, 20, 5, help="Past this, rule-based summaries are shown.")
-    ai_delay = st.slider("Delay before each OpenAI call (sec)", 0.0, 3.0, 1.2, 0.1)
-    sec_delay = st.slider("Delay between SEC doc downloads (sec)", 0.0, 3.0, 1.0, 0.1)
-
-    st.markdown("---")
     max_rows = st.slider("Max filings to show", 5, 100, 30, step=5)
     forms_filter = st.multiselect(
         "Filter form types",
@@ -228,7 +275,7 @@ if not cik10:
     st.stop()
 
 # ------------------------------
-# Fetch company filings
+# Fetch submissions
 # ------------------------------
 with st.spinner("Fetching company submissions from SEC…"):
     try:
@@ -238,15 +285,18 @@ with st.spinner("Fetching company submissions from SEC…"):
         st.stop()
 
 name = company.get("name", "")
-st.subheader(f"{name} — CIK {cik10}  🔗")
+st.subheader(f"{name} — CIK {cik10}")
+
 recent = company.get("filings", {}).get("recent", {})
 if not recent:
     st.warning("No recent filings found.")
     st.stop()
 
+# Build DataFrame of recent filings
 cols = [
     "accessionNumber", "filingDate", "reportDate", "acceptanceDateTime",
-    "form", "items", "size", "primaryDocument", "primaryDocDescription"
+    "act", "form", "fileNumber", "filmNumber", "items", "size",
+    "isInlineXBRL", "isXBRL", "primaryDocument", "primaryDocDescription"
 ]
 rows = []
 for i in range(len(recent.get("accessionNumber", []))):
@@ -257,6 +307,7 @@ for i in range(len(recent.get("accessionNumber", []))):
 
 df = pd.DataFrame(rows)
 
+# Apply filters
 if forms_filter:
     df = df[df["form"].isin(forms_filter)]
 if keyword:
@@ -266,54 +317,88 @@ if keyword:
 df = df.sort_values("filingDate", ascending=False).head(max_rows).reset_index(drop=True)
 
 # ------------------------------
-# Render filings (pacing + caching)
+# Display Table
 # ------------------------------
 st.markdown("### Latest Filings")
 
-ai_calls = 0
-for _, r in df.iterrows():
+# Pretty table
+display_df = df[["filingDate", "form", "primaryDocDescription", "accessionNumber", "url_index", "url_primary"]].copy()
+display_df.rename(columns={
+    "filingDate": "Date",
+    "form": "Form",
+    "primaryDocDescription": "Description",
+    "accessionNumber": "Accession",
+    "url_index": "Index",
+    "url_primary": "Primary Doc",
+}, inplace=True)
+
+# Convert to clickable links in Streamlit using unsafe_allow_html for this table
+def linkify(url, text):
+    return f"<a href='{url}' target='_blank'>{text}</a>"
+
+display_html = "<table>\n<tr><th>Date</th><th>Form</th><th>Description</th><th>Accession</th><th>Links</th></tr>"
+for _, r in display_df.iterrows():
+    links = f"{linkify(r['Index'], 'Index')} | {linkify(r['Primary Doc'], 'Doc')}"
+    display_html += f"<tr>" \
+                    f"<td>{r['Date']}</td>" \
+                    f"<td>{r['Form']}</td>" \
+                    f"<td>{(r['Description'] or '')[:120]}</td>" \
+                    f"<td>{r['Accession']}</td>" \
+                    f"<td>{links}</td>" \
+                    f"</tr>"
+display_html += "</table>"
+
+st.markdown(display_html, unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ------------------------------
+# Per‑filing Summaries
+# ------------------------------
+for idx, r in df.iterrows():
     with st.expander(f"{r['filingDate']} • {r['form']} • {r['primaryDocDescription']}"):
-        st.write(f"Accession: {r['accessionNumber']}")
+        st.write(f"Accession: {r['accessionNumber']}  ")
         st.write(f"[Index]({r['url_index']}) • [Primary Document]({r['url_primary']})")
 
         with st.spinner("Downloading & parsing primary document…"):
             try:
-                time.sleep(sec_delay)  # polite pause before each SEC doc fetch
                 text = get_primary_doc_text(cik10, r['accessionNumber'], r['primaryDocument'])
+                # light throttle to be extra kind to SEC
+                time.sleep(0.3)
             except Exception as e:
                 st.error(f"Failed to fetch primary document: {e}")
                 continue
 
-        # Rule-based summary (always available)
-        rs = rule_summary(r['form'], text)
+        summary = generate_rule_based_summary(r['form'], text)
+        ai_text = ai_summarize(text, r['form'], ai_model) if use_ai else ""
 
-        # Optional AI one-paragraph summary (throttled & cached)
-        ai_text = ""
-        if use_ai and ai_calls < max_ai:
-            ai_text = ai_summarize_one_paragraph(r['accessionNumber'], r['form'], text, ai_model, ai_delay)
-            if ai_text:
-                ai_calls += 1
-            elif ai_calls >= max_ai:
-                st.info("Reached AI summary limit for this run.")
+        # Render impact pill
+        impact_color = {"Positive": "#16a34a", "Neutral": "#64748b", "Negative": "#dc2626"}.get(summary["impact"], "#64748b")
+        st.markdown(f"""
+            <div style='display:inline-block;padding:4px 10px;border-radius:12px;background:{impact_color};color:#fff;font-weight:600;'>
+                {summary['impact']}
+            </div>
+        """, unsafe_allow_html=True)
 
-        # Impact pill
-        impact_color = {"Positive": "#16a34a", "Neutral": "#64748b", "Negative": "#dc2626"}.get(rs["impact"], "#64748b")
-        st.markdown(
-            f"<div style='display:inline-block;padding:4px 10px;border-radius:12px;background:{impact_color};color:#fff;font-weight:600;'>{rs['impact']}</div>",
-            unsafe_allow_html=True
-        )
-
+        st.markdown(f"**Headline:** {summary['headline']}")
         if ai_text:
-            st.markdown("**AI (one-paragraph) summary:**")
+            st.markdown("**OpenAI summary:**")
             st.write(ai_text)
         else:
-            st.markdown(f"**Rule-based headline:** {rs['headline']}")
-            if rs["bullets"]:
-                st.markdown("**Signals detected:**")
-                for b in rs["bullets"]:
-                    st.markdown(f"- {b}")
+            st.markdown("**Rule-based summary:**")
+        if summary["bullets"]:
+            st.markdown("**Signals detected:**")
+            for b in summary["bullets"]:
+                st.markdown(f"- {b}")
 
+        # Show preview of the filing text with keyword highlighting
+        preview = text[:8000]
+        # rudimentary highlighting
+        if keyword:
+            patt = re.compile(re.escape(keyword), re.IGNORECASE)
+            preview = patt.sub(lambda m: f"**{m.group(0)}**", preview)
         st.markdown("**Document preview (first ~8k chars):**")
-        st.code(text[:8000])
+        st.code(preview)
 
-st.caption("Data: SEC EDGAR. Summaries are heuristic or AI-generated — not investment advice.")
+st.markdown("---")
+st.caption("Data: SEC EDGAR. Summaries are heuristic and informational — not investment advice.")
