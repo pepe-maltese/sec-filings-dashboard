@@ -41,6 +41,28 @@ import streamlit as st
 # ------------------------------
 # Config
 # ------------------------------
+# Build a resilient HTTP session with retries/backoff (handles 403/429 from SEC)
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def make_session():
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    retry = Retry(
+        total=5,
+        read=5,
+        connect=5,
+        backoff_factor=0.8,
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+SESSION = None
 # Prefer Streamlit Secrets on Streamlit Cloud; fallback to env
 try:
     import streamlit as st  # already imported later, but safe here
@@ -68,15 +90,23 @@ def pad_cik(cik: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_company_submissions(cik10: str) -> dict:
+    global SESSION
+    SESSION = SESSION or make_session()
     url = f"{SEC_BASE}/submissions/CIK{cik10}.json"
-    r = requests.get(url, headers=HEADERS, timeout=30)
+    r = SESSION.get(url, timeout=30)
+    if r.status_code == 403:
+        st.error("SEC returned 403 (forbidden). Make sure your SEC_USER_AGENT secret is set to 'Your Name your@email.com'. Then restart the app.")
     r.raise_for_status()
     return r.json()
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_company_ticker_map() -> pd.DataFrame:
+    global SESSION
+    SESSION = SESSION or make_session()
     url = f"{SEC_BASE}/files/company_tickers.json"
-    r = requests.get(url, headers=HEADERS, timeout=30)
+    r = SESSION.get(url, timeout=30)
+    if r.status_code == 403:
+        st.error("SEC returned 403 (forbidden) while fetching ticker map. Check SEC_USER_AGENT in Secrets and try again.")
     r.raise_for_status()
     data = r.json()
     # Convert to DataFrame
@@ -101,9 +131,13 @@ def cik_from_ticker(ticker: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_primary_doc_text(cik10: str, accession_no: str, primary_doc: str) -> str:
+    global SESSION
+    SESSION = SESSION or make_session()
     acc_nodash = accession_no.replace("-", "")
     url = f"{ARCHIVES}/edgar/data/{int(cik10)}/{acc_nodash}/{primary_doc}"
-    r = requests.get(url, headers=HEADERS, timeout=60)
+    r = SESSION.get(url, timeout=60)
+    if r.status_code == 403:
+        st.error("SEC returned 403 while fetching the primary document. Verify SEC_USER_AGENT and try again.")
     r.raise_for_status()
     # Parse HTML -> text
     soup = BeautifulSoup(r.text, "lxml")
