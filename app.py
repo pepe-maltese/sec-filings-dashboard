@@ -41,7 +41,13 @@ import streamlit as st
 # ------------------------------
 # Config
 # ------------------------------
-SEC_UA = os.getenv("SEC_USER_AGENT", "FilingsDashboard/1.0 (contact: please-set-email@example.com)")
+# Prefer Streamlit Secrets on Streamlit Cloud; fallback to env
+try:
+    import streamlit as st  # already imported later, but safe here
+    _secret_ua = st.secrets.get("SEC_USER_AGENT") if hasattr(st, "secrets") else None
+except Exception:
+    _secret_ua = None
+SEC_UA = _secret_ua or os.getenv("SEC_USER_AGENT", "FilingsDashboard/1.0 (contact: please-set-email@example.com)")
 DEFAULT_CIK = os.getenv("DEFAULT_CIK", "0001829311")  # BMNR
 SEC_BASE = "https://data.sec.gov"
 ARCHIVES = "https://www.sec.gov/Archives"
