@@ -154,10 +154,9 @@ def ai_summarize(text: str, form: str, model: str = "gpt-4o-mini") -> str:
         return ""
     try:
         client = OpenAI(api_key=key)
-        prompt = f"""You are an equity research assistant. Read the SEC filing excerpt below and write:
-- A one-line headline.
-- 3–6 bullet points covering material items (financing like ATM/PIPE/warrants, buybacks, guidance, M&A, crypto holdings, and any Item references).
-- Keep it factual, concise, and neutral.
+        prompt = f"""You are an equity research assistant. Summarize the SEC filing excerpt in a single concise paragraph (4–6 sentences).
+Focus on financing (ATM/PIPE/warrants), buybacks, guidance, M&A, crypto holdings, and any Item references.
+Be factual, neutral, and precise. Avoid speculation.
 
 Form: {form}
 
