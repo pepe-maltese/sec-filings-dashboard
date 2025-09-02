@@ -31,6 +31,12 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+# Optional: OpenAI summaries
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 # Ensure Streamlit writes to a writable dir on HF Spaces (repo FS is read-only)
 os.environ.setdefault("STREAMLIT_HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
@@ -78,7 +84,48 @@ HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
 
 st.set_page_config(page_title="SEC Filings Dashboard", page_icon="📄", layout="wide")
 st.title("📄 Real‑Time SEC Filings Dashboard")
-st.caption("Zero‑cost deployable. Live feed from SEC EDGAR with local, rule‑based summaries.")
+st.caption("Zero‑cost deployable. Live feed from SEC EDGAR with local, rule‑based summaries. Optional: OpenAI-powered summaries if you add an API key.")
+
+# ------------------------------
+# OpenAI (optional) — AI summaries
+# ------------------------------
+
+def ai_summarize(text: str, form: str, model: str = "gpt-4o-mini") -> str:
+    """Return an AI-written summary paragraph. Requires OPENAI_API_KEY in secrets.
+    Falls back to rule-based summary if unavailable or errors."""
+    key = None
+    try:
+        key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else os.getenv("OPENAI_API_KEY")
+    except Exception:
+        key = os.getenv("OPENAI_API_KEY")
+    if not key or not OpenAI:
+        return ""
+    try:
+        client = OpenAI(api_key=key)
+        prompt = (
+            "You are an equity research assistant. Read the SEC filing excerpt below and write a concise, factual "
+            "summary (4-6 sentences) with a one-line headline first, then 3-6 bullet points of the most material items. "
+            "Prioritize financing (ATM/PIPE/warrants), buybacks, guidance, M&A, crypto holdings, and any Item references.
+
+"
+            f"Form: {form}
+
+Filing excerpt (may be partial):
+" + text[:16000]
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Be terse, precise, and neutral. Avoid speculation."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        st.info(f"AI summary skipped: {e}")
+        return ""
 
 # ------------------------------
 # Helpers
@@ -213,6 +260,8 @@ with st.sidebar:
     cik10 = pad_cik(cik_input) if mode == "CIK" else cik_from_ticker(default_ticker)
 
     st.markdown("---")
+    use_ai = st.checkbox("Use OpenAI summaries (optional)", value=False, help="Requires OPENAI_API_KEY in Secrets")
+    ai_model = st.text_input("OpenAI model", value="gpt-4o-mini") if use_ai else None
     max_rows = st.slider("Max filings to show", 5, 100, 30, step=5)
     forms_filter = st.multiselect(
         "Filter form types",
@@ -321,6 +370,7 @@ for idx, r in df.iterrows():
                 continue
 
         summary = generate_rule_based_summary(r['form'], text)
+        ai_text = ai_summarize(text, r['form'], ai_model) if use_ai else ""
 
         # Render impact pill
         impact_color = {"Positive": "#16a34a", "Neutral": "#64748b", "Negative": "#dc2626"}.get(summary["impact"], "#64748b")
@@ -331,6 +381,11 @@ for idx, r in df.iterrows():
         """, unsafe_allow_html=True)
 
         st.markdown(f"**Headline:** {summary['headline']}")
+        if ai_text:
+            st.markdown("**OpenAI summary:**")
+            st.write(ai_text)
+        else:
+            st.markdown("**Rule-based summary:**")
         if summary["bullets"]:
             st.markdown("**Signals detected:**")
             for b in summary["bullets"]:
